@@ -9,7 +9,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const JWT_SECRET = process.env.JWT_SECRET || 'focustrack-dev-secret-change-in-prod';
+const JWT_SECRET = process.env.JWT_SECRET || 'timewise-dev-secret-change-in-prod';
 const PORT = process.env.PORT || 3000;
 
 // ─── Database ─────────────────────────────────────────────────────────────────
@@ -286,5 +286,5 @@ app.get('/api/streaks', auth, async (req, res) => {
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
-  console.log(`\n🎯 FocusTrack API running at http://localhost:${PORT}\n`);
+  console.log(`\n🎯 TimeWise API running at http://localhost:${PORT}\n`);
 });
