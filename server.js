@@ -47,6 +47,10 @@ app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(join(__dirname, '../dashboard')));
 
+app.get('/health', (_req, res) => {
+  res.json({ ok: true });
+});
+
 // ─── Auth Routes ──────────────────────────────────────────────────────────────
 
 app.post('/api/auth/register', async (req, res) => {
@@ -285,6 +289,6 @@ app.get('/api/streaks', auth, async (req, res) => {
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🎯 TimeWise API running at http://localhost:${PORT}\n`);
 });
