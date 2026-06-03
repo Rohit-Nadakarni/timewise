@@ -1,143 +1,54 @@
-# ◈ TimeWise
+# Timewise
 
-A Chromium browser extension + web dashboard to track your browsing activity, set time-based goals, and build daily streaks.
-
----
+A Chromium browser extension and web dashboard for live browser activity tracking, focus goals, and streaks.
 
 ## Project Structure
 
-```
-timewise/
-├── extension/          ← Load this into Chrome
+```text
+focustrack/
+├── extension/          Load this into Chrome
 │   ├── manifest.json
-│   ├── background.js   ← Core tracker (service worker)
+│   ├── background.js
 │   ├── popup.html/css/js
 │   └── icons/
-├── backend/            ← Node.js API server
+├── backend/            Deploy this to Render
 │   ├── server.js
-│   └── db.json         ← Auto-created file database
-└── dashboard/          ← Served by the backend at /
+│   ├── schema.sql      Run this in Supabase first
+│   └── package.json
+└── dashboard/          Served automatically by the backend
     └── index.html
 ```
 
----
+## Deployment
 
-## Setup
+### Supabase
 
-### 1. Backend Server
+1. Create a Supabase project.
+2. Open SQL Editor.
+3. Paste and run `backend/schema.sql`.
+4. Copy the database connection string from Project Settings.
 
-**Requirements:** Node.js 18+
+### Render
 
-```bash
-cd backend
-npm install
-node server.js
-```
+1. Create a Render web service.
+2. Set the root directory to `backend`.
+3. Use `npm install` as the build command.
+4. Use `node server.js` as the start command.
+5. Add `DATABASE_URL`, `JWT_SECRET`, and `NODE_ENV=production`.
 
-The server starts at `http://localhost:3000`.  
-The dashboard is served at `http://localhost:3000` automatically.
+### URLs
 
-**Environment variables (optional):**
-```
-PORT=3000
-JWT_SECRET=your-secret-key-here
-```
+Update these constants if your deployed API or dashboard URL changes:
 
----
-
-### 2. Chrome Extension
-
-1. Open Chrome and go to `chrome://extensions`
-2. Enable **Developer Mode** (top right toggle)
-3. Click **Load Unpacked**
-4. Select the `extension/` folder
-
-The TimeWise icon will appear in your toolbar.
-
----
-
-### 3. First Use
-
-1. Click the extension icon → **Sign Up** with your email
-2. Tracking starts automatically once logged in
-3. Add goals in the popup (click **+ Add**) or on the dashboard
-4. Open the dashboard at `http://localhost:3000` for full reports
-
----
+- `extension/background.js`: `API_BASE`
+- `extension/popup.js`: `API_BASE`
+- `dashboard/index.html`: `API`
 
 ## How It Works
 
-### Tracking
-- The background service worker watches `tabs.onActivated` and `tabs.onUpdated`
-- It records time spent per domain (idle detection pauses tracking)
-- Sessions are buffered locally and synced to the server every 5 minutes
-- All data is also stored in `chrome.storage.local` for offline use
-
-### Goals
-- You define a goal with a **name**, **target time** (e.g. 1h 30m), and **domains**
-- Multiple domains can be grouped into one goal (e.g. github.com + theodinproject.com = "Learning")
-- Progress is calculated from actual tracked time today
-- When you hit the target: **notification fires + streak updates**
-
-### Streaks
-- A streak increments when you hit a goal's target on consecutive days
-- Missing a day resets the current streak (longest streak is preserved)
-- Streaks are shown as 🔥 count in both the popup and dashboard
-
----
-
-## Deploying to Production
-
-### Backend (e.g., Railway, Render, Fly.io)
-
-1. Push the `backend/` folder
-2. Set `JWT_SECRET` env var to a random string
-3. Copy your hosted URL (e.g. `https://timewise.up.railway.app`)
-
-### Update URLs
-
-Replace `http://localhost:3000` in three places:
-- `extension/background.js` → `const API_BASE = '...'`
-- `extension/popup.js` → `const API_BASE = '...'`
-- `dashboard/index.html` → `const API = '...'`
-
-Then reload the extension in Chrome.
-
----
-
-## API Reference
-
-| Method | Endpoint | Auth | Description |
-|--------|----------|------|-------------|
-| POST | /api/auth/register | — | Create account |
-| POST | /api/auth/login | — | Get JWT token |
-| GET | /api/auth/me | ✓ | Current user |
-| POST | /api/sessions/sync | ✓ | Upload sessions |
-| GET | /api/sessions | ✓ | List sessions |
-| GET | /api/analytics/daily | ✓ | Daily totals |
-| GET | /api/analytics/top-domains | ✓ | Top domains |
-| GET | /api/goals | ✓ | List goals |
-| POST | /api/goals | ✓ | Create goal |
-| DELETE | /api/goals/:id | ✓ | Delete goal |
-| GET | /api/streaks | ✓ | Streak data for all goals |
-
----
-
-## Customization
-
-### Change idle timeout
-In `background.js`, edit:
-```js
-chrome.idle.setDetectionInterval(60); // seconds of no input
-```
-
-### Change sync frequency
-```js
-chrome.alarms.create('syncData', { periodInMinutes: 5 }); // every 5 mins
-```
-
-### Add more goal types
-Currently goals are time-based. You can extend the goal schema to support:
-- Session count goals (open site X times)
-- Page visit goals
-- Consecutive day goals without time targets
+- The extension samples open tabs every 3 seconds while the service worker is awake.
+- The focused tab is recorded as active time.
+- Other open tabs, idle browser time, and unfocused browser time are recorded as idle/open time.
+- Sessions sync to the server every 3 seconds when the user is signed in.
+- The dashboard polls the API every 3 seconds and renders active and idle time separately.
+- Goals are calculated from active focused-tab time.

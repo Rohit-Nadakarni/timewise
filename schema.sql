@@ -1,5 +1,5 @@
--- FocusTrack Database Schema
--- Paste this into Supabase → SQL Editor → Run
+-- Timewise Database Schema
+-- Paste this into Supabase SQL Editor and run it.
 
 CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY,
@@ -17,8 +17,12 @@ CREATE TABLE IF NOT EXISTS sessions (
   start_time BIGINT,
   end_time BIGINT,
   duration INTEGER NOT NULL,
-  date DATE NOT NULL
+  date DATE NOT NULL,
+  activity_type TEXT NOT NULL DEFAULT 'active'
 );
+
+ALTER TABLE sessions
+  ADD COLUMN IF NOT EXISTS activity_type TEXT NOT NULL DEFAULT 'active';
 
 CREATE TABLE IF NOT EXISTS goals (
   id UUID PRIMARY KEY,
@@ -30,7 +34,7 @@ CREATE TABLE IF NOT EXISTS goals (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Indexes for performance
 CREATE INDEX IF NOT EXISTS idx_sessions_user_date ON sessions(user_id, date);
+CREATE INDEX IF NOT EXISTS idx_sessions_user_activity_date ON sessions(user_id, activity_type, date);
 CREATE INDEX IF NOT EXISTS idx_sessions_domain ON sessions(domain);
 CREATE INDEX IF NOT EXISTS idx_goals_user ON goals(user_id);

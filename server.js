@@ -8,10 +8,8 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const JWT_SECRET = process.env.JWT_SECRET || 'focustrack-dev-secret-change-in-prod';
+const JWT_SECRET = process.env.JWT_SECRET || 'timewise-dev-secret-change-in-prod';
 const PORT = process.env.PORT || 3000;
-
-// ─── Database ─────────────────────────────────────────────────────────────────
 
 const { Pool } = pg;
 const pool = new Pool({
@@ -19,7 +17,6 @@ const pool = new Pool({
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
-// Create tables if they don't exist
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -38,7 +35,8 @@ async function initDB() {
       start_time BIGINT,
       end_time BIGINT,
       duration INTEGER NOT NULL,
-      date DATE NOT NULL
+      date DATE NOT NULL,
+      activity_type TEXT NOT NULL DEFAULT 'active'
     );
 
     CREATE TABLE IF NOT EXISTS goals (
@@ -51,19 +49,28 @@ async function initDB() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
 
+    ALTER TABLE sessions
+      ADD COLUMN IF NOT EXISTS activity_type TEXT NOT NULL DEFAULT 'active';
+
     CREATE INDEX IF NOT EXISTS idx_sessions_user_date ON sessions(user_id, date);
+    CREATE INDEX IF NOT EXISTS idx_sessions_user_activity_date ON sessions(user_id, activity_type, date);
+    CREATE INDEX IF NOT EXISTS idx_sessions_domain ON sessions(domain);
     CREATE INDEX IF NOT EXISTS idx_goals_user ON goals(user_id);
   `);
-  console.log('Database ready');
+  console.log('Timewise database ready');
 }
 
 await initDB();
 
-// ─── Auth Middleware ──────────────────────────────────────────────────────────
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '2mb' }));
+app.use(express.static(join(__dirname, '../dashboard')));
 
 function auth(req, res, next) {
   const header = req.headers.authorization;
   if (!header) return res.status(401).json({ error: 'No token' });
+
   const token = header.replace('Bearer ', '');
   try {
     req.user = jwt.verify(token, JWT_SECRET);
@@ -73,32 +80,43 @@ function auth(req, res, next) {
   }
 }
 
-// ─── App Setup ────────────────────────────────────────────────────────────────
+function normalizeActivityType(value) {
+  return value === 'idle' ? 'idle' : 'active';
+}
 
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: '2mb' }));
-app.use(express.static(join(__dirname, '../dashboard')));
+function normalizeDomain(domain) {
+  return String(domain || '').trim().replace(/^www\./, '').toLowerCase();
+}
 
-// ─── Auth Routes ──────────────────────────────────────────────────────────────
+function dateFromSession(session) {
+  if (session.date) return session.date;
+  if (session.startTime) return new Date(session.startTime).toISOString().split('T')[0];
+  return new Date().toISOString().split('T')[0];
+}
+
+app.get('/api/health', (_req, res) => {
+  res.json({ ok: true, name: 'Timewise' });
+});
 
 app.post('/api/auth/register', async (req, res) => {
   const { name, email, password } = req.body;
-  if (!name || !email || !password)
+  if (!name || !email || !password) {
     return res.status(400).json({ error: 'All fields required' });
+  }
 
-  const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
+  const cleanEmail = email.toLowerCase();
+  const existing = await pool.query('SELECT id FROM users WHERE email = $1', [cleanEmail]);
   if (existing.rows.length) return res.status(409).json({ error: 'Email already registered' });
 
   const hashed = await bcrypt.hash(password, 10);
   const id = uuid();
   await pool.query(
     'INSERT INTO users (id, name, email, password) VALUES ($1, $2, $3, $4)',
-    [id, name, email.toLowerCase(), hashed]
+    [id, name, cleanEmail, hashed]
   );
 
-  const token = jwt.sign({ id, email: email.toLowerCase() }, JWT_SECRET, { expiresIn: '90d' });
-  res.json({ token, user: { id, name, email: email.toLowerCase() } });
+  const token = jwt.sign({ id, email: cleanEmail }, JWT_SECRET, { expiresIn: '90d' });
+  res.json({ token, user: { id, name, email: cleanEmail } });
 });
 
 app.post('/api/auth/login', async (req, res) => {
@@ -122,30 +140,50 @@ app.get('/api/auth/me', auth, async (req, res) => {
   res.json({ user: result.rows[0] });
 });
 
-// ─── Sessions Routes ──────────────────────────────────────────────────────────
-
 app.post('/api/sessions/sync', auth, async (req, res) => {
   const { sessions } = req.body;
   if (!Array.isArray(sessions)) return res.status(400).json({ error: 'Invalid payload' });
 
+  const cleanSessions = sessions
+    .map(session => ({
+      url: session.url || null,
+      domain: normalizeDomain(session.domain),
+      startTime: Number(session.startTime) || Date.now(),
+      endTime: Number(session.endTime) || Date.now(),
+      duration: Math.max(1, Math.round(Number(session.duration) || 0)),
+      date: dateFromSession(session),
+      activityType: normalizeActivityType(session.activityType || session.activity_type)
+    }))
+    .filter(session => session.domain && session.duration > 0);
+
+  if (!cleanSessions.length) return res.json({ synced: 0 });
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    for (const s of sessions) {
+    for (const session of cleanSessions) {
       await client.query(
-        `INSERT INTO sessions (id, user_id, url, domain, start_time, end_time, duration, date)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        `INSERT INTO sessions
+          (id, user_id, url, domain, start_time, end_time, duration, date, activity_type)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
         [
-          uuid(), req.user.id, s.url, s.domain,
-          s.startTime, s.endTime, s.duration,
-          s.date || new Date(s.startTime).toISOString().split('T')[0]
+          uuid(),
+          req.user.id,
+          session.url,
+          session.domain,
+          session.startTime,
+          session.endTime,
+          session.duration,
+          session.date,
+          session.activityType
         ]
       );
     }
     await client.query('COMMIT');
-    res.json({ synced: sessions.length });
-  } catch (e) {
+    res.json({ synced: cleanSessions.length });
+  } catch (error) {
     await client.query('ROLLBACK');
+    console.error('[Timewise] sync failed', error);
     res.status(500).json({ error: 'Sync failed' });
   } finally {
     client.release();
@@ -154,60 +192,103 @@ app.post('/api/sessions/sync', auth, async (req, res) => {
 
 app.get('/api/sessions', auth, async (req, res) => {
   const { from, to, limit = 500 } = req.query;
-  let query = 'SELECT * FROM sessions WHERE user_id = $1';
+  let query = `
+    SELECT
+      id,
+      url,
+      domain,
+      start_time AS "startTime",
+      end_time AS "endTime",
+      duration,
+      date::text,
+      activity_type AS "activityType"
+    FROM sessions
+    WHERE user_id = $1
+  `;
   const params = [req.user.id];
 
-  if (from) { params.push(from); query += ` AND date >= $${params.length}`; }
-  if (to)   { params.push(to);   query += ` AND date <= $${params.length}`; }
+  if (from) {
+    params.push(from);
+    query += ` AND date >= $${params.length}`;
+  }
+  if (to) {
+    params.push(to);
+    query += ` AND date <= $${params.length}`;
+  }
 
-  query += ` ORDER BY start_time DESC LIMIT $${params.length + 1}`;
-  params.push(parseInt(limit));
+  params.push(Math.min(2000, parseInt(limit, 10) || 500));
+  query += ` ORDER BY start_time DESC LIMIT $${params.length}`;
 
   const result = await pool.query(query, params);
   res.json({ sessions: result.rows });
 });
 
-// ─── Analytics Routes ─────────────────────────────────────────────────────────
-
 app.get('/api/analytics/daily', auth, async (req, res) => {
-  const { days = 30 } = req.query;
+  const days = Math.min(90, Math.max(1, parseInt(req.query.days, 10) || 30));
   const result = await pool.query(`
+    WITH domain_rollup AS (
+      SELECT
+        date,
+        domain,
+        SUM(CASE WHEN activity_type = 'active' THEN duration ELSE 0 END)::int AS active,
+        SUM(CASE WHEN activity_type = 'idle' THEN duration ELSE 0 END)::int AS idle,
+        SUM(duration)::int AS total
+      FROM sessions
+      WHERE user_id = $1
+        AND date >= CURRENT_DATE - ($2::int - 1)
+      GROUP BY date, domain
+    )
     SELECT
       date::text,
-      SUM(duration) AS "totalSeconds",
-      json_object_agg(domain, domain_total) AS domains
-    FROM (
-      SELECT date, domain, SUM(duration) AS domain_total
-      FROM sessions
-      WHERE user_id = $1 AND date >= CURRENT_DATE - ($2::int - 1)
-      GROUP BY date, domain
-    ) sub
+      SUM(total)::int AS "totalSeconds",
+      SUM(active)::int AS "activeSeconds",
+      SUM(idle)::int AS "idleSeconds",
+      jsonb_object_agg(domain, active) AS domains,
+      jsonb_object_agg(
+        domain,
+        jsonb_build_object('active', active, 'idle', idle, 'total', total)
+      ) AS "domainTotals"
+    FROM domain_rollup
     GROUP BY date
     ORDER BY date ASC
-  `, [req.user.id, parseInt(days)]);
+  `, [req.user.id, days]);
 
   res.json({ daily: result.rows });
 });
 
 app.get('/api/analytics/top-domains', auth, async (req, res) => {
-  const { days = 7 } = req.query;
+  const days = Math.min(90, Math.max(1, parseInt(req.query.days, 10) || 7));
   const result = await pool.query(`
-    SELECT domain, SUM(duration) AS seconds
+    SELECT
+      domain,
+      SUM(CASE WHEN activity_type = 'active' THEN duration ELSE 0 END)::int AS "activeSeconds",
+      SUM(CASE WHEN activity_type = 'idle' THEN duration ELSE 0 END)::int AS "idleSeconds",
+      SUM(duration)::int AS "totalSeconds",
+      SUM(CASE WHEN activity_type = 'active' THEN duration ELSE 0 END)::int AS seconds
     FROM sessions
-    WHERE user_id = $1 AND date >= CURRENT_DATE - ($2::int - 1)
+    WHERE user_id = $1
+      AND date >= CURRENT_DATE - ($2::int - 1)
     GROUP BY domain
-    ORDER BY seconds DESC
-    LIMIT 20
-  `, [req.user.id, parseInt(days)]);
+    ORDER BY "activeSeconds" DESC, "totalSeconds" DESC
+    LIMIT 30
+  `, [req.user.id, days]);
 
   res.json({ domains: result.rows });
 });
 
-// ─── Goals Routes ─────────────────────────────────────────────────────────────
-
 app.get('/api/goals', auth, async (req, res) => {
   const result = await pool.query(
-    'SELECT id, user_id AS "userId", name, target_hours AS "targetHours", target_minutes AS "targetMinutes", domains, created_at AS "createdAt" FROM goals WHERE user_id = $1 ORDER BY created_at ASC',
+    `SELECT
+      id,
+      user_id AS "userId",
+      name,
+      target_hours AS "targetHours",
+      target_minutes AS "targetMinutes",
+      domains,
+      created_at AS "createdAt"
+     FROM goals
+     WHERE user_id = $1
+     ORDER BY created_at ASC`,
     [req.user.id]
   );
   res.json({ goals: result.rows });
@@ -217,12 +298,29 @@ app.post('/api/goals', auth, async (req, res) => {
   const { name, targetHours, targetMinutes, domains } = req.body;
   if (!name) return res.status(400).json({ error: 'Name required' });
 
+  const cleanDomains = Array.isArray(domains)
+    ? domains.map(normalizeDomain).filter(Boolean)
+    : [];
   const id = uuid();
+  const hours = parseInt(targetHours, 10) || 0;
+  const minutes = parseInt(targetMinutes, 10) || 0;
+
   await pool.query(
-    'INSERT INTO goals (id, user_id, name, target_hours, target_minutes, domains) VALUES ($1, $2, $3, $4, $5, $6)',
-    [id, req.user.id, name, targetHours || 0, targetMinutes || 0, domains || []]
+    `INSERT INTO goals
+      (id, user_id, name, target_hours, target_minutes, domains)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [id, req.user.id, name, hours, minutes, cleanDomains]
   );
-  res.json({ goal: { id, name, targetHours, targetMinutes, domains } });
+
+  res.json({
+    goal: {
+      id,
+      name,
+      targetHours: hours,
+      targetMinutes: minutes,
+      domains: cleanDomains
+    }
+  });
 });
 
 app.delete('/api/goals/:id', auth, async (req, res) => {
@@ -230,58 +328,82 @@ app.delete('/api/goals/:id', auth, async (req, res) => {
   res.json({ ok: true });
 });
 
-// ─── Streaks API ──────────────────────────────────────────────────────────────
-
 app.get('/api/streaks', auth, async (req, res) => {
   const goalsResult = await pool.query(
-    'SELECT id, name, target_hours AS "targetHours", target_minutes AS "targetMinutes", domains FROM goals WHERE user_id = $1',
+    `SELECT
+      id,
+      name,
+      target_hours AS "targetHours",
+      target_minutes AS "targetMinutes",
+      domains
+     FROM goals
+     WHERE user_id = $1`,
     [req.user.id]
   );
-  const goals = goalsResult.rows;
 
-  const streaks = await Promise.all(goals.map(async goal => {
+  const streaks = await Promise.all(goalsResult.rows.map(async goal => {
     const targetSec = (goal.targetHours || 0) * 3600 + (goal.targetMinutes || 0) * 60;
     const domains = goal.domains || [];
 
     if (!domains.length || targetSec === 0) {
-      return { goalId: goal.id, goalName: goal.name, currentStreak: 0, longestStreak: 0, totalDaysHit: 0, lastHit: null };
+      return {
+        goalId: goal.id,
+        goalName: goal.name,
+        currentStreak: 0,
+        longestStreak: 0,
+        totalDaysHit: 0,
+        lastHit: null
+      };
     }
 
-    // Get all dates where this goal's domains were used enough
     const result = await pool.query(`
-      SELECT date::text, SUM(duration) AS total
+      SELECT date::text, SUM(duration)::int AS total
       FROM sessions
-      WHERE user_id = $1 AND domain = ANY($2)
+      WHERE user_id = $1
+        AND activity_type = 'active'
+        AND domain = ANY($2::text[])
       GROUP BY date
       HAVING SUM(duration) >= $3
       ORDER BY date ASC
     `, [req.user.id, domains, targetSec]);
 
-    const hitDates = result.rows.map(r => r.date);
-    if (!hitDates.length) return { goalId: goal.id, goalName: goal.name, currentStreak: 0, longestStreak: 0, totalDaysHit: 0, lastHit: null };
+    const hitDates = result.rows.map(row => row.date);
+    if (!hitDates.length) {
+      return {
+        goalId: goal.id,
+        goalName: goal.name,
+        currentStreak: 0,
+        longestStreak: 0,
+        totalDaysHit: 0,
+        lastHit: null
+      };
+    }
 
     const today = new Date().toISOString().split('T')[0];
     const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
-
-    // Current streak (from end)
     let current = 0;
-    for (let i = hitDates.length - 1; i >= 0; i--) {
+
+    for (let i = hitDates.length - 1; i >= 0; i -= 1) {
       if (i === hitDates.length - 1) {
         if (hitDates[i] !== today && hitDates[i] !== yesterday) break;
         current = 1;
       } else {
-        const diff = Math.round((new Date(hitDates[i+1]) - new Date(hitDates[i])) / 86400000);
-        if (diff === 1) current++;
+        const diff = Math.round((new Date(hitDates[i + 1]) - new Date(hitDates[i])) / 86400000);
+        if (diff === 1) current += 1;
         else break;
       }
     }
 
-    // Longest streak
-    let longest = 1, run = 1;
-    for (let i = 1; i < hitDates.length; i++) {
-      const diff = Math.round((new Date(hitDates[i]) - new Date(hitDates[i-1])) / 86400000);
-      if (diff === 1) { run++; longest = Math.max(longest, run); }
-      else run = 1;
+    let longest = 1;
+    let run = 1;
+    for (let i = 1; i < hitDates.length; i += 1) {
+      const diff = Math.round((new Date(hitDates[i]) - new Date(hitDates[i - 1])) / 86400000);
+      if (diff === 1) {
+        run += 1;
+        longest = Math.max(longest, run);
+      } else {
+        run = 1;
+      }
     }
 
     return {
@@ -297,8 +419,6 @@ app.get('/api/streaks', auth, async (req, res) => {
   res.json({ streaks });
 });
 
-// ─── Start ────────────────────────────────────────────────────────────────────
-
 app.listen(PORT, () => {
-  console.log(`\n🎯 FocusTrack API running at http://localhost:${PORT}\n`);
+  console.log(`Timewise API running at http://localhost:${PORT}`);
 });
